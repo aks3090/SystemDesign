@@ -2,174 +2,373 @@
 
 Companion to [sensor-fleet-management-system-design.md](sensor-fleet-management-system-design.md). That doc is everything you *know*. This doc is what you *say* in 50 minutes and in what order.
 
-Target level: **Lead (e.g. Salesforce LMTS) to Staff**. Lead is judged mostly on a solid, well-driven design with clear trade-offs. Staff adds: naming the real problem early, designing for failure and blast radius, and thinking about how the system is operated and evolved.
+Target level: **Lead (e.g. Salesforce LMTS) to Staff**.
+
+**How this playbook is built:** it follows the **traditional system design skeleton** that interviewers score against (requirements → estimates → APIs → data model → high-level design → deep dives → scaling and bottlenecks → wrap). The Lead/Staff signal comes from *what you choose to go deep on* (rollout safety), not from skipping the basics. Cover the basics quickly and cleanly, then spend the depth on safety.
 
 ---
 
 ## The One Thing to Remember
 
-Interviewers expect you to start with scale. **Start by saying scale is not the hard part; safety is.** Everything you draw after that supports this point.
+Do the standard steps, but **name the real problem early**:
 
-> "1.2M devices is about 4K check-ins per second and a few GB of state. That's easy. The hard part is that we're shipping kernel-level code to 1.2M machines. One bad update can brick the fleet (the CrowdStrike July 2024 incident is the example), and whoever controls this system can run code everywhere. So I'll optimize for safety first, then security, then speed."
+> "1.2M devices is about 4K check-ins per second and a few GB of state, which is manageable. The hard part is that we're shipping kernel-level code to 1.2M machines. One bad update can brick the fleet (the CrowdStrike July 2024 incident is the example), and whoever controls this system can run code everywhere. I'll cover the standard design first, then go deep on safe rollouts."
 
 ---
 
 ## Time Plan (50 min)
 
-| Min | Phase | Goal | Output on the board |
-|---|---|---|---|
-| 0–5 | Clarify | Scope + key assumptions | 5–6 bullet requirements |
-| 5–8 | Estimate + framing | Show scale is easy, safety is hard | 4 numbers + priority order |
-| 8–11 | Principles | 4 rules the whole design follows | 4 short lines |
-| 11–20 | High-level design | Boxes + one end-to-end flow | One diagram |
-| 20–38 | Deep dives (3–4) | Depth where it matters | Rollout state machine, cohorts/gates, on-device safety, check-in |
-| 38–45 | Failures + security | Walk the scary cases | Failure table (spoken), trust boundaries |
-| 45–50 | Trade-offs, operations, wrap | Judgment and ownership | 3 trade-offs + "how we run it" |
+| Min | Phase | Board output |
+|---|---|---|
+| 0–5 | 1. Requirements | Functional + non-functional bullets |
+| 5–8 | 2. Capacity estimates | 4–5 numbers |
+| 8–12 | 3. API design | Device APIs + admin APIs |
+| 12–16 | 4. Data model + storage choice | 5–6 tables, which DB and why |
+| 16–24 | 5. High-level design + main flow | Architecture diagram + sequence of one rollout |
+| 24–38 | 6. Deep dives | Rollout engine, canary groups and gates, on-device safety |
+| 38–45 | 7. Scaling, bottlenecks, failures, security | Scaling table + failure table |
+| 45–50 | 8. Trade-offs + wrap | 3 trade-offs, what's next |
 
-**Clock checkpoints: 11, 20, 38, 45.**
-- Behind at 20: drop deep dive C (check-in) and keep A and B.
-- Behind at 38: give failures as 4 one-liners and go straight to trade-offs.
-- Ahead at 38: ask the interviewer, "Is there an area you'd like more depth on?"
-
-Leave the last 5 minutes for wrap-up no matter what. Ending mid-sentence on a deep dive looks worse than covering one fewer topic.
+**Clock checkpoints: 12, 24, 38, 45.**
+- Behind at 24: cut deep dive C to 2 minutes.
+- Behind at 38: give 4 failure one-liners and go to trade-offs.
+- Ahead at 38: ask "Is there an area you'd like more depth on?"
 
 ---
 
-## Phase 1 (0–5 min): Clarify
+## 1. Requirements (0–5 min)
 
-Ask 5–6 questions, then **state assumptions and move on**.
+Ask 4–5 questions, then **state assumptions and move on**.
 
-1. "Is this a vendor platform with many customer tenants, or one company's fleet?" (Assume multi-tenant.)
-2. "What changes do we ship: agent binaries only, or also detection content and policy?" (Assume all three. Content ships often and is the riskiest.)
-3. "Do sensors have kernel components?" (Assume yes on Windows, eBPF/system extensions on Linux/macOS.)
-4. "Any restricted or air-gapped networks?" (Assume some.)
-5. "How fast must an urgent detection update reach the fleet?" (Assume hours, not seconds.)
-6. "Do customers control their own update timing (maintenance windows, pinning)?" (Assume yes.)
+1. "Vendor platform with many customer tenants, or one company's fleet?" (Assume multi-tenant.)
+2. "What do we ship: agent binaries only, or also detection content and policy?" (Assume all three.)
+3. "Do sensors have kernel components?" (Assume yes.)
+4. "Restricted or air-gapped networks?" (Assume some.)
+5. "How fast must an urgent detection update reach the fleet?" (Assume hours.)
 
 Write on the board:
 
 ```
-Functional: enroll/inventory · upgrade agent · distribute policy + content
-            · progressive rollout + gates + halt/rollback · health · rollout monitoring
-Non-func:   devices stay protected if control plane is down
-            · kill switch < 60s · signed everything · offline devices converge later
-Out:        detection engine itself, EDR event data lake
+Functional
+  - Enroll devices, keep inventory
+  - Upgrade sensor software remotely
+  - Distribute security policy + detection content
+  - Progressive rollout with health checks, pause, rollback, kill switch
+  - Devices report health
+  - Dashboard for rollout progress
+
+Non-functional
+  - 1.2M devices, many OSes, unreliable networks
+  - Devices stay protected even if our backend is down
+  - Kill switch reaches online devices in < 60 s
+  - Everything signed and authenticated
+  - Offline devices catch up when they return
 ```
 
-## Phase 2 (5–8 min): Numbers and Framing
+## 2. Capacity Estimates (5–8 min)
 
-| Number | Value |
+| Item | Math | Result |
+|---|---|---|
+| Check-in QPS | 1.2M devices / 300 s | **~4K rps** avg, design for **40K** (reconnect storm) |
+| Push connections | ~75% online | **~900K** long-lived connections, ~40 gateway nodes at ~50K each with headroom |
+| Device state storage | 1.2M × 4 KB | **~5 GB** |
+| Health telemetry | 4K/s × 2 KB | **~8 MB/s**, ~0.7 TB/day |
+| Artifact bandwidth | 80 MB × 900K devices in 1 day | **~7 Gbps**, so use a CDN |
+
+Conclusion to say out loud: "QPS and storage are moderate. Bandwidth needs a CDN. The real risk is safety, which I'll focus on in the deep dives."
+
+## 3. API Design (8–12 min)
+
+**Device-facing** (mTLS, device certificate):
+
+| API | Request | Response |
+|---|---|---|
+| `POST /v1/enroll` | tenant token, public key (CSR), device info | device cert, device_id, assigned cell |
+| `POST /v1/checkin` | device_id, current versions (agent, content, policy), last applied generation, health summary | desired versions + download URLs + new generation, or **304 Not Modified**, plus next check-in time |
+| `POST /v1/events` | batch of `{event_id, rollout_id, state, error}` | 200 (idempotent by event_id) |
+| `GET cdn/sha256/{hash}` | | signed artifact (from CDN) |
+| `WS /v1/notify` | | "check in now" hints only |
+
+**Admin-facing** (SSO + role-based access, every call audited):
+
+| API | Purpose |
 |---|---|
-| Check-ins | 1.2M / 5 min ≈ **4K rps**, design 40K for reconnect storms |
-| Concurrent connections (push hint) | ~900K, ~40 gateway nodes |
-| Device state | ~4 KB × 1.2M ≈ **5 GB** |
-| Artifact egress | 80 MB × 900K in a day ≈ **~7 Gbps**, so use a CDN |
+| `POST /v1/releases` | Register a build (CI only) |
+| `POST /v1/policies/{id}/versions` | New immutable policy version, returns validation + impact preview |
+| `POST /v1/rollouts` | `{release or policy, target selector, stage plan, gates}` |
+| `POST /v1/rollouts/{id}:approve / :pause / :resume / :rollback` | Lifecycle |
+| `GET /v1/rollouts/{id}/progress` | Funnel + gate status per stage and OS group |
+| `POST /v1/halt` | Kill switch |
 
-Then say the priority order out loud: **safety > security > protection availability > rollout speed > cost.**
+Point to make: "Check-in uses a **generation number** like an ETag. If nothing changed, the server returns 304. That keeps 4K rps cheap."
 
-## Phase 3 (8–11 min): Four Principles
+## 4. Data Model and Storage (12–16 min)
 
-1. **Pull-based desired state.** The server says *what* a device should run. The device pulls, reconciles and reports. Push is only a "check in now" hint.
-2. **Every change is a rollout.** Binary, content and policy all go through rings and gates. Urgent means a shorter schedule, never skipping the canary.
-3. **The device protects itself.** It verifies signatures, keeps the last good version, and rolls back on its own.
-4. **Never break the recovery path.** The updater is separate from the sensor and stays alive when the sensor crashes.
+```mermaid
+erDiagram
+    TENANT ||--o{ DEVICE : owns
+    DEVICE ||--o{ DEVICE_EVENT : emits
+    RELEASE ||--o{ ARTIFACT : "one per OS/arch"
+    POLICY ||--o{ POLICY_VERSION : "immutable versions"
+    ROLLOUT }o--|| RELEASE : "deploys"
+    ROLLOUT }o--o| POLICY_VERSION : "or deploys"
+    ROLLOUT ||--o{ ROLLOUT_STAGE : "ordered stages"
 
-## Phase 4 (11–20 min): High-Level Design
-
-Draw this. Keep it to about 12 boxes.
-
+    DEVICE {
+        uuid device_id PK
+        uuid tenant_id
+        int cell_id
+        string os_kernel_arch
+        string agent_version
+        string content_rev
+        string policy_rev
+        bigint ack_generation
+        json health
+        timestamp last_seen
+    }
+    ROLLOUT {
+        uuid rollout_id PK
+        string change_type
+        json target_selector
+        string state
+        int current_stage
+        json gates
+    }
+    ROLLOUT_STAGE {
+        uuid rollout_id FK
+        int stage_index
+        int percent
+        int bake_minutes
+        string state
+    }
+    RELEASE {
+        uuid release_id PK
+        string component
+        string version
+        json compatibility
+    }
+    ARTIFACT {
+        string sha256 PK
+        uuid release_id FK
+        string os_arch
+        bigint size
+        string signature
+    }
+    DEVICE_EVENT {
+        uuid event_id PK
+        uuid device_id
+        uuid rollout_id
+        string state
+        string error_code
+        timestamp ts
+    }
 ```
- [Device: Updater | Sensor | Watchdog | Validator | A/B slots]
-        |  mTLS check-in (pull)       ^ "check in now" hint
-        v                             |
- [Gateway] --> [Desired State Svc] --> [Device State DB]      (per cell, ~200K devices)
-        |
-        v
- [Kafka] --> [Flink] --> [ClickHouse] --> [Rollout Orchestrator] --> [Config DB: rollouts]
-                              |                   ^
-                              v                   |
-                        [Dashboards]        [Admin API]
-                                                  |
-                       [Policy Svc / Release Svc] --> [Signing Svc (HSM, M-of-N)] --> [CDN / Relay]
-                                                                                          ^
- Device downloads signed artifacts from CDN ----------------------------------------------+
+
+**Which store and why:**
+
+| Data | Store | Why | Partition / index |
+|---|---|---|---|
+| Rollouts, releases, policies, approvals | **Postgres** (global, HA) | Small, relational, needs transactions | Index on state, tenant |
+| Devices (inventory + reported state) | **Postgres per cell**, sharded | ~5 GB total, frequent updates, ops queries | Shard by `hash(device_id)`. Index on tenant, OS group, last_seen |
+| Device events + health | **Kafka → ClickHouse** | High write volume, aggregations by rollout/stage/OS | Kafka partition by device_id. ClickHouse ordered by (rollout_id, os_group, ts) |
+| Artifacts | **Object storage + CDN** | Large, immutable, cached at the edge | Key = content hash |
+| Push connection registry | **Redis** | Short-lived, high churn | Key = device_id → gateway node |
+| Audit log | Append-only store + write-once (WORM) object storage | Tamper evidence | By time |
+
+## 5. High-Level Design (16–24 min)
+
+### 5.1 Architecture
+
+Draw this:
+
+```mermaid
+flowchart TB
+    subgraph DEV["Device (Windows / macOS / Linux)"]
+        UPD["Updater<br/>check-in · download · verify · rollback"]
+        SEN["Sensor Engine<br/>user + kernel"]
+        WD["Watchdog<br/>health · crash-loop detection"]
+        AB[("A/B slots<br/>current + last good version")]
+        UPD --- AB
+        WD --- SEN
+    end
+
+    LB["Load Balancer"]
+    CDN["CDN<br/>signed artifacts"]
+
+    subgraph CELL["Cell: ~200K devices (x6)"]
+        GW["Gateway<br/>stateless · mTLS · rate limit"]
+        DSS["Desired State Service<br/>rollout snapshot in memory"]
+        DDB[("Device DB<br/>Postgres, sharded")]
+        REDIS[("Redis<br/>push connections")]
+        KAFKA[["Kafka<br/>events + health"]]
+    end
+
+    subgraph CTRL["Global Control Plane"]
+        ADMIN["Admin API + Console"]
+        ORCH["Rollout Orchestrator<br/>stages · gates · halt"]
+        POL["Policy Service"]
+        REL["Release Service"]
+        SIGN["Signing Service<br/>HSM · multi-person approval"]
+        CDB[("Config DB<br/>Postgres: rollouts, releases, policies")]
+    end
+
+    subgraph ANA["Analytics"]
+        FLINK["Flink<br/>stream aggregation"]
+        CH[("ClickHouse<br/>rollout health")]
+        DASH["Dashboards + Alerts"]
+    end
+
+    UPD -->|"check-in (pull)"| LB --> GW
+    GW -.->|"check in now (push hint)"| UPD
+    UPD -->|"download"| CDN
+    GW --> DSS --> DDB
+    GW --- REDIS
+    GW --> KAFKA
+
+    ADMIN --> ORCH
+    ADMIN --> POL
+    ADMIN --> REL
+    POL --> SIGN
+    REL --> SIGN
+    SIGN -->|"publish signed files"| CDN
+    ORCH --> CDB
+    CDB -->|"rollout snapshot"| DSS
+
+    KAFKA --> FLINK --> CH
+    CH -->|"gate checks"| ORCH
+    CH --> DASH
 ```
 
-Walk through **one flow end to end** (about 3 min):
-"An operator creates a rollout. The orchestrator opens 0.1% of each OS group. The device checks in, the desired state service sees its hash bucket is in range and returns the new version. The device downloads from the CDN, verifies the signature, installs to slot B, and runs a probation check. It reports health. Flink compares upgraded devices to non-upgraded ones in the same group. The orchestrator moves to the next ring or halts."
+Explain in 4 sentences:
+1. "Devices **pull** their desired state through stateless gateways. Push is only a hint to check in sooner."
+2. "The **Desired State Service** decides what each device should run, using an in-memory rollout snapshot. No DB write per device when a stage opens."
+3. "Binaries and policies are **signed** by a separate signing service and served from a **CDN**."
+4. "Health flows through **Kafka → Flink → ClickHouse**, and the **Orchestrator** uses it to advance or halt rollouts."
 
-Then 1 minute on **policy flow** to show it's covered: "Policy goes through the same engine: author → lint → compile per agent schema → sign → per-tenant rings."
+### 5.2 Main Flow: One Rollout
 
-## Phase 5 (20–38 min): Deep Dives
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Op as Operator
+    participant API as Admin API
+    participant OR as Orchestrator
+    participant DS as Desired State Svc
+    participant GW as Gateway
+    participant AG as Device Agent
+    participant CDN as CDN
+    participant AN as Kafka / Flink / ClickHouse
 
-Offer a choice: **"I'd like to go deep on rollout safety, since that's where the risk is. Would you rather I cover something else?"** Then do these in order.
+    Op->>API: Create rollout v7.13 (approved)
+    API->>OR: Start rollout
+    OR->>DS: Publish snapshot: stage 1 = 0.1% per OS group
+    OR->>GW: Send "check in now" hints
+    AG->>GW: Check-in (versions, health, generation)
+    GW->>DS: What should this device run?
+    DS-->>GW: v7.13 (device's hash bucket is in range)
+    GW-->>AG: Desired state + download URL
+    AG->>CDN: Download artifact
+    AG->>AG: Verify signature, install to slot B, probation
+    alt Healthy
+        AG->>GW: Event: COMMITTED
+    else Unhealthy
+        AG->>AG: Switch back to slot A
+        AG->>GW: Event: ROLLED_BACK
+    end
+    GW->>AN: Events + health
+    OR->>AN: Gate check: upgraded vs not-upgraded group
+    alt Gates pass after bake time
+        OR->>DS: Open next stage (1%)
+    else Gates fail
+        OR->>DS: Halt + rollback
+        OR->>Op: Page on-call
+    end
+```
 
-### A. Rollout engine (must do, ~6 min)
+## 6. Deep Dives (24–38 min)
+
+Say: **"I'd like to go deep on rollout safety, since that's where the risk is. Would you rather I cover something else?"**
+
+### A. Rollout engine (~5 min)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Draft
+    Draft --> Approved: M-of-N approvals
+    Approved --> StageRunning: start
+    StageRunning --> Baking: stage opened
+    Baking --> GateCheck: bake time + min sample reached
+    GateCheck --> StageRunning: pass, next stage
+    GateCheck --> Paused: stale data / soft fail
+    GateCheck --> RollingBack: hard fail
+    Baking --> RollingBack: tripwire (crashes, devices gone silent)
+    Paused --> StageRunning: resume
+    Paused --> RollingBack: abort
+    GateCheck --> Completed: last stage passed
+    RollingBack --> RolledBack
+    Completed --> [*]
+    RolledBack --> [*]
+```
 
 - Rings: lab → 0.1% → 1% → 10% → 50% → 100%.
-- Durable state machine (Temporal-style): Draft → Approved → StageRunning → Baking → GateEval → next / Paused / RollingBack → Completed. Draw it.
-- Idempotent steps, single writer per rollout with fencing.
-- Global guardrails enforced in code: velocity budget (max % of fleet changing per hour), one rollout per component per group, freeze windows, kill switch.
-- Halt vs rollback vs fix-forward: halt stops new devices; rollback is a new rollout to the previous version; fix-forward is most common for content.
+- Durable workflow (Temporal-style), idempotent steps, one writer per rollout.
+- Guardrails enforced in code: max % of fleet changing per hour, one rollout per component per OS group, freeze windows, kill switch.
+- Halt = stop new devices. Rollback = new rollout to previous version. Fix-forward = most common for content.
 
-### B. Cohorts and health gates (must do, ~5 min)
+### B. Choosing canary devices and health gates (~5 min)
 
-- Cohorts: `hash(device_id, rollout_salt) mod 10000`, **stratified per OS/kernel group**. Widening only adds buckets, so devices never flip. Rare kernels get a minimum count so they appear early.
-- Gates: **treatment vs control** in the same group and time window. This cancels noise like Patch Tuesday.
-- Advance needs **bake time AND minimum sample size**. At 0.1% you only catch catastrophic bugs. At 1% (~12K) you can detect about a 2x crash regression in a day.
-- **Fail closed:** stale telemetry means pause, never pass.
-- **Silence after an update is a failure signal**, because a crashed device can't report.
-- Monitoring: funnel (notified → downloaded → installed → healthy), per-group gate status, ETA.
+- Cohort = `hash(device_id, rollout_salt) mod 10000`, **spread evenly across each OS/kernel group**. Widening only adds buckets, so devices never flip back. Rare kernels get a minimum count.
+- Gates compare **upgraded vs not-upgraded devices** in the same OS group and time window. This cancels noise like Patch Tuesday.
+- Advance only after **bake time AND minimum sample size**. 0.1% only catches catastrophic bugs. 1% (~12K) catches about a 2x crash increase in a day.
+- **Missing data = pause, never pass.**
+- **Silence after an update is a failure signal.** A crashed device can't report.
 
-### C. On-device safety (must do, ~4 min)
+### C. On-device safety (~4 min)
 
-- Split agent: updater / sensor engine / watchdog / content validator.
-- A/B slots, probation window, local auto-rollback, local quarantine of a bad version.
-- **Boot-loop counter**: 2 failed boots means load in safe mode with the last good version, updater still alive. "A bricked device becomes a degraded but reachable one."
-- **Validate content in a user-mode sandbox before kernel code reads it.** This is the direct lesson from CrowdStrike.
+- Separate processes: updater / sensor / watchdog / content validator.
+- A/B slots, probation window, automatic local rollback.
+- **Boot-loop counter**: 2 failed boots means the next boot loads the last good version in safe mode, and the updater stays alive. "A bricked device becomes a reachable one."
+- **Validate content in a sandboxed user-mode process before kernel code reads it.** Direct lesson from CrowdStrike.
 
-### D. Check-in and propagation (if time, ~3 min)
+## 7. Scaling, Bottlenecks, Failures, Security (38–45 min)
 
-- Generation numbers, `304` when nothing changed.
-- Desired state computed on read from a small in-memory snapshot. This avoids 1.2M writes per stage.
-- Jitter, `429 Retry-After`, exponential backoff for reconnect storms.
-- Kill switch: push hint for connected devices (< 60 s), poll interval for the rest.
+### 7.1 Scaling (the traditional checklist, ~2 min)
 
-## Phase 6 (38–45 min): Failures and Security
+| Concern | Solution |
+|---|---|
+| Check-in load | Stateless gateways behind load balancers, autoscale, 304 responses |
+| Hot reads | Rollout snapshot cached in memory in every Desired State instance |
+| DB scale | Shard device DB by device_id, read replicas, one DB per cell |
+| Write spikes | Kafka buffers events and health |
+| Bandwidth | CDN + binary deltas + on-prem relay for restricted networks |
+| Reconnect storm | Random jitter, rate limiting with `429 Retry-After`, exponential backoff |
+| Growth to 5M | Add cells (~200K devices each) |
+| Region failure | Cells per region, failover to paired region |
 
-**Failures (~4 min), one line each:**
+### 7.2 Failures (~3 min, one line each)
 
 | Scenario | Answer |
 |---|---|
-| Device offline 3 weeks | Converges to *current* desired state on return. No replay. Keeps old policy meanwhile. |
-| Control plane down | Devices keep enforcing last good policy. Nothing new rolls out. |
-| Telemetry pipeline down | Gates can't pass, rollouts pause. |
-| Bad content crashes the kernel | Sandbox validation, rings, boot-loop safe mode, "devices went silent" tripwire halts in minutes. |
-| Bad policy blocks business apps | Linting, impact preview, audit-mode dry run, per-tenant rings, block-rate gate. |
-| Region/cell down | Cells isolate the blast radius. Fail over to paired region. |
-| Reconnect storm | Jitter, admission control, 304 cache. |
-| Orchestrator crash | Durable workflow, idempotent steps, fencing tokens. |
+| Device offline 3 weeks | Converges to *current* desired state on return. Keeps last good policy meanwhile. |
+| Backend down | Devices keep protecting. Nothing new rolls out. |
+| Telemetry down | Gates can't pass, rollouts pause. |
+| Bad content crashes kernel | Sandbox validation, rings, boot-loop safe mode, silence tripwire. |
+| Bad policy blocks business apps | Linting, impact preview, dry run in audit mode, per-tenant rings. |
+| Orchestrator crash | Durable workflow, idempotent steps. |
 
-**Security (~3 min):**
-- **Signing is separate from distribution.** HSM, M-of-N approvals, TUF metadata, pinned root on device. "If the control plane is hacked, it still can't sign code."
-- mTLS, short-lived TPM-bound device certs, anti-rollback floor, 2-person rule for platform-wide actions, append-only audit.
-- Telemetry integrity: only authenticated devices report, so fake devices can't make a bad rollout look healthy.
+### 7.3 Security (~2 min)
 
-## Phase 7 (45–50 min): Trade-offs, Operations, Wrap
+- **Signing is separate from distribution**: HSM, multi-person approval, TUF-style metadata, root key pinned on device. "A hacked backend still can't sign code."
+- mTLS with short-lived device certs, minimum-version floor against downgrade attacks, role-based access, append-only audit log.
 
-**Three trade-offs (~2 min):**
-1. **Pull + hint vs pure push:** pull is correct through NAT and offline. Push alone isn't idempotent.
-2. **Ringed content vs instant content:** costs 1–3 hours on urgent detections, but prevents the CrowdStrike failure.
-3. **Cells vs one global cluster:** more ops work, but limits damage from our own bad deploys.
+## 8. Trade-offs and Wrap (45–50 min)
 
-**How we run it (~2 min, strong Staff signal):**
-- The control plane itself deploys cell by cell, canary cell first.
-- The updater gets the most conservative rollout of all.
-- Game days: kill a cell, inject bad content in the lab, cut the CDN.
-- Every incident produces a new automated gate or lint rule, not just a process note.
-- Phased delivery: foundation (signed updates + local rollback) → automated gates → policy/content → cells/multi-region.
+1. **Pull + push hint vs pure push:** pull works through NAT and for offline devices. Push alone isn't idempotent.
+2. **Compute desired state on read vs store per device:** avoids 1.2M writes per stage. Cost: need an "explain this device's state" debug tool.
+3. **Ringed content vs instant content:** costs 1–3 hours on urgent detections, prevents a CrowdStrike-style outage.
+4. **Cells vs one big cluster:** more ops work, smaller blast radius.
 
-**Close (~1 min):** "If I had more time I'd go into the exact gate statistics, the policy compiler for mixed agent versions, and moving more sensor logic out of the kernel (eBPF, system extensions), which is the best long-term safety lever."
+Close: "Next I'd go into gate statistics, the policy compiler for mixed agent versions, and moving logic out of the kernel (eBPF, system extensions)."
 
 ---
 
@@ -177,62 +376,54 @@ Offer a choice: **"I'd like to go deep on rollout safety, since that's where the
 
 | Senior | Lead (LMTS) | Staff |
 |---|---|---|
-| Starts with Kafka, DBs, sharding | Clear requirements, clean design, explains each component's job | Says scale is easy and names safety as the real problem |
-| "Canary then full rollout" | Rings with health checks and rollback | Stratified cohorts, control groups, sample-size-aware gates, fail closed |
-| Server-side rollback | Device keeps old version, can roll back | Device rolls back by itself, boot-loop safe mode, recovery path protected |
-| "Sign the binaries" | Signed artifacts, mTLS, RBAC | Signing separate from distribution, M-of-N, survives control-plane compromise |
-| Rollouts for binaries | Rollouts for binaries and policy | Rollouts for **every** change, including content |
-| Answers questions | Drives the session, manages time | Also covers how the platform is operated, evolved and staffed |
+| Good boxes, misses APIs/data model or safety | Full standard skeleton, clean APIs and schema, clear trade-offs | Same skeleton, plus names safety as the real problem early |
+| "Canary then full rollout" | Rings with health checks and rollback | Even spread across OS groups, compare against non-upgraded devices, sample size, missing data = pause |
+| Server-side rollback | Device keeps old version | Device rolls back by itself, boot-loop safe mode |
+| "Sign the binaries" | Signed artifacts, mTLS, role-based access | Signing separate from distribution, survives backend compromise |
+| Answers questions | Drives the session, manages time | Also covers operating and evolving the platform |
 
-For a Lead interview, the Lead column is the bar, and a few Staff points (safety framing, silence-as-failure, sandboxed content validation) set you apart.
+For a Lead interview, **don't skip the standard steps**. Interviewers look for APIs, data model and scaling. Then add a few Staff points (safety framing, silence after an update as a failure signal, sandboxed content validation) to stand out.
 
 ---
 
 ## Likely Follow-Ups With Short Answers
 
-**"A 0-day is spreading. You need new detection content everywhere in 30 minutes. What do you do?"**
-Compressed ring plan: lab 5 min, 1% 10 min, 10% 10 min, then the rest, with tripwire-only gates (crashes, silence). Content was already validated in the sandbox. I'd push back on skipping rings entirely, and say the trade-off out loud: 30 minutes of slightly slower coverage vs the risk of bricking the fleet. It's a business decision, and I'd want it pre-agreed, not made during the incident.
+**"Why Postgres for devices and not Cassandra/DynamoDB?"**
+5 GB total and ~4K writes/s split across 6 cells is small. Postgres gives transactions and flexible ops queries. If writes grow 10x, move device state to a wide-column store.
 
-**"How do you pick the canary devices?"**
-Hash buckets stratified by OS/version/kernel/arch, with a minimum count per group, opted-in customers first, and a new salt per rollout so the same customers aren't always first.
+**"How do you shard?"**
+First by cell (~200K devices), then by `hash(device_id)` inside the cell. Kafka partitioned by device_id to keep per-device ordering.
 
-**"How do you know an upgrade is bad if the device crashed and can't report?"**
-Silence after an update. Compare the "went offline after change" rate to the control group. A spike halts the rollout.
+**"What do you cache?"**
+Rollout snapshots in memory (read on every check-in), 304 responses via generation numbers, artifacts on the CDN.
 
-**"Device is fully bricked by a kernel bug. Now what?"**
-Boot-loop counter makes the next boot load safe mode with the last good version. The updater is still running, so we can deliver a fix. Without that, it's manual recovery, which is exactly what we're designing against.
+**"A 0-day is spreading. Content everywhere in 30 minutes?"**
+Compressed rings: lab 5 min, 1% 10 min, 10% 10 min, then the rest, with only tripwire gates. Never skip rings. It's a business trade-off that should be agreed in advance.
 
-**"What if someone hacks your admin console?"**
-They can create a rollout but can't sign code: signing needs HSM + M-of-N + provenance. Rings and the velocity budget still apply, and they're enforced in code. Policy changes that disable protection need extra approval. The audit log is tamper-evident.
+**"How do you know an upgrade is bad if the device crashed?"**
+Devices that go silent after an update. Compare their rate to devices that weren't upgraded. A spike halts the rollout.
 
-**"How do you handle 10 versions in the field at once?"**
-Compatibility matrix in the release metadata. Support direct upgrade from N-3. The policy compiler emits a bundle per schema version, and the server serves the matching one.
+**"Device fully bricked?"**
+Boot-loop counter → safe mode with last good version → updater alive → we push a fix.
 
-**"Why not store desired state per device in a DB?"**
-That works, but opening a stage would mean 1.2M writes. Computing on read from a small snapshot is deterministic and cheap. The cost is debuggability, so we build an "explain desired state for device X" tool.
+**"Admin console hacked?"**
+They can't sign code (HSM + multi-person approval). Rings and rate limits are enforced in code. The audit log is tamper-evident.
 
-**"How would you test the platform itself?"**
-Synthetic devices per OS group in every cell running full rollouts continuously, a lab farm, game days, and the control plane rolled out cell by cell.
-
-**"What's the data model?"**
-Device, DeviceState (reported vs desired, generation), Release, Artifact, PolicyVersion (immutable), Rollout, RolloutStage, DeviceEvent (idempotent). Rollouts in a strongly consistent DB, device state sharded per cell.
-
-**"How do you scale to 5M devices?"**
-Add cells. Each cell is ~200K devices with its own gateways, DB and Kafka. The global plane is low-QPS and doesn't grow much.
+**"10 versions in the field?"**
+Compatibility matrix in release metadata, direct upgrade from up to 3 versions back, policy compiled per schema version.
 
 ---
 
 ## Pitfalls to Avoid
 
-- Spending more than 5 minutes on clarifying or 3 on estimates.
+- **Skipping APIs and the data model.** Interviewers look for them even when the "interesting" part is elsewhere.
+- Spending more than 5 minutes on requirements or 3 on estimates.
 - Drawing 25 boxes before explaining one flow.
-- Going deep on database choice early. Mention Postgres/Kafka/ClickHouse in one line and move on.
-- Saying "canary" without saying how you pick it and how you decide it passed.
-- Forgetting content and policy rollouts. Many candidates only cover binaries.
+- Saying "canary" without saying how you pick devices and how you decide a stage passed.
+- Covering only binaries and forgetting content and policy rollouts.
 - Forgetting that the device must recover **without** the server.
 - Not stating trade-offs. Every choice should come with "the cost is…".
-- Running out of time before failures and security. Use the checkpoints.
-- Not checking in with the interviewer. Ask "does this match what you want to explore?" at 11 and 20 minutes.
+- Not checking in with the interviewer at minutes 12 and 24.
 
 ---
 
@@ -240,8 +431,8 @@ Add cells. Each cell is ~200K devices with its own gateways, DB and Kafka. The g
 
 | They push toward | Pivot |
 |---|---|
-| Scale / storage | Cells of 200K, stateless gateways, Postgres per cell, compute-on-read. Then bring it back: "the bottleneck that matters is risk, not throughput." |
-| Security | Phase 6 security, plus the threat list: control-plane compromise, supply chain, rollback attack, insider, local tampering. |
-| Monitoring | Funnel, per-group gates, ETA, alerts on stuck rollouts, fleet drift view. |
-| Policy | Immutable versions, per-schema compile, linting for dangerous rules, impact preview, audit-mode dry run, per-tenant rings. |
-| Product / org | Tenant update channels (early/default/late/pinned), maintenance windows, critical groups go last, freeze windows, who approves what. |
+| Scale / storage | Section 7.1 table, shard key, cells. Then: "the bottleneck that matters is risk, not throughput." |
+| Security | Section 7.3, plus threats: backend compromise, supply chain, downgrade attack, insider, local tampering. |
+| Monitoring | Funnel (notified → downloaded → installed → healthy), per-group gates, ETA, alerts on stuck rollouts. |
+| Policy | Immutable versions, compile per schema, lint dangerous rules, impact preview, dry run, per-tenant rings. |
+| Product / org | Tenant update channels (early/default/late/pinned), maintenance windows, critical servers go last. |
