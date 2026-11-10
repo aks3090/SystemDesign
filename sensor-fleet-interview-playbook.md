@@ -285,6 +285,189 @@ sequenceDiagram
     end
 ```
 
+### 5.3 Data Flow Diagrams (DFD)
+
+How to read them:
+
+| Shape | Meaning |
+|---|---|
+| Rectangle | External actor (person or system outside our platform) |
+| Circle | Process (something that transforms data) |
+| Cylinder | Data store |
+| Arrow label | The data that moves, numbered in order |
+
+#### Level 0: Context (whole system as one box)
+
+```mermaid
+flowchart LR
+    CI["CI / Build System"]
+    OPS["Operator / Release Approver"]
+    TADM["Tenant Security Admin"]
+    DEV["1.2M Devices"]
+    SYS(("Sensor Fleet<br/>Management Platform"))
+    ONC["On-call Engineer"]
+
+    CI -->|"sensor builds"| SYS
+    OPS -->|"rollout plans, approvals, halt"| SYS
+    TADM -->|"policies, update settings"| SYS
+    SYS -->|"desired state, signed artifacts, signed policies"| DEV
+    DEV -->|"current versions, health, upgrade events"| SYS
+    SYS -->|"rollout progress, gate status"| OPS
+    SYS -->|"alerts, pages"| ONC
+```
+
+#### Level 1: Sensor Upgrade Data Flow
+
+```mermaid
+flowchart TB
+    CI["CI / Build"]
+    APR["Release Approvers"]
+    OP["Operator"]
+    DEV["Device Agent"]
+    ONC["On-call"]
+
+    P1(("1. Register<br/>release"))
+    P2(("2. Sign<br/>artifacts"))
+    P3(("3. Create<br/>rollout"))
+    P4(("4. Compute<br/>desired state"))
+    P5(("5. Download,<br/>verify, install,<br/>probation"))
+    P6(("6. Ingest<br/>events + health"))
+    P7(("7. Aggregate<br/>health per stage<br/>and OS group"))
+    P8(("8. Evaluate<br/>gates"))
+
+    D1[("D1 Release Registry")]
+    D2[("D2 Artifact Store + CDN")]
+    D3[("D3 Rollout DB")]
+    D4[("D4 Device DB")]
+    D5[("D5 Event Stream (Kafka)")]
+    D6[("D6 Health Metrics (ClickHouse)")]
+
+    CI -->|"1a. build + test results + provenance"| P1
+    P1 -->|"1b. release record, compat matrix"| D1
+    APR -->|"2a. approvals (M-of-N)"| P2
+    D1 -->|"2b. artifact hashes"| P2
+    P2 -->|"2c. signed artifacts + signed metadata"| D2
+
+    OP -->|"3a. target, stage plan, gates"| P3
+    D4 -->|"3b. device counts per OS group (impact preview)"| P3
+    P3 -->|"3c. rollout + stage snapshot (0.1% open)"| D3
+
+    DEV -->|"4a. check-in: versions, generation, health"| P4
+    D3 -->|"4b. rollout snapshot"| P4
+    D4 -->|"4c. device attributes"| P4
+    P4 -->|"4d. reported state"| D4
+    P4 -->|"4e. desired version + download URL, or 304"| DEV
+
+    D2 -->|"5a. artifact + signature"| P5
+    DEV <-->|"5b. install into slot B, commit or roll back"| P5
+
+    P5 -->|"6a. events: DOWNLOADED, INSTALLED, HEALTHY / ROLLED_BACK"| P6
+    P6 -->|"6b. events + health"| D5
+    D5 -->|"7a. stream"| P7
+    D4 -->|"7b. last seen (silent devices)"| P7
+    P7 -->|"7c. crash rate, rollback rate, offline rate: upgraded vs not upgraded"| D6
+
+    D6 -->|"8a. stage metrics + data freshness"| P8
+    P8 -->|"8b. pass: open next stage / fail: halt + rollback"| D3
+    P8 -->|"8c. page on failure"| ONC
+    P8 -.->|"8d. check in now hint"| DEV
+```
+
+| Step | What happens |
+|---|---|
+| 1 | CI registers a tested build. Release record + compatibility matrix stored in D1. |
+| 2 | After multi-person approval, the signing service signs artifacts and metadata, which are published to D2 (CDN). |
+| 3 | Operator creates a rollout. Impact preview reads device counts from D4. Stage 1 (0.1% per OS group) is written to D3. |
+| 4 | On check-in, the device sends its versions and health. The service reads the rollout snapshot (D3) and device attributes (D4), saves reported state, and returns the desired version or 304. |
+| 5 | Device downloads from CDN, verifies signature and hash, installs into slot B, runs probation, then commits or switches back to slot A. |
+| 6 | Device reports each step as an idempotent event. Events go to Kafka (D5). |
+| 7 | Flink computes per-stage, per-OS-group health for upgraded vs not-upgraded devices. Devices that went silent count as failures. Stored in D6. |
+| 8 | Orchestrator checks gates after bake time + minimum sample size. Pass: open next stage in D3. Fail: halt, rollback, page on-call, push hints. **The loop 4 → 8 repeats for every stage.** |
+
+#### Level 1: Config / Policy Rollout Data Flow
+
+```mermaid
+flowchart TB
+    TA["Tenant Security Admin"]
+    APR["Second Approver"]
+    DEV["Device Agent"]
+    ONC["Tenant Admin + On-call"]
+
+    Q1(("1. Save new<br/>policy version"))
+    Q2(("2. Validate<br/>+ lint"))
+    Q3(("3. Impact<br/>preview"))
+    Q4(("4. Compile per<br/>schema + sign"))
+    Q5(("5. Create<br/>tenant rollout"))
+    Q6(("6. Compute<br/>desired state"))
+    Q7(("7. Download,<br/>verify, sandbox<br/>validate, apply"))
+    Q8(("8. Aggregate<br/>health + block rate"))
+    Q9(("9. Evaluate<br/>gates"))
+
+    E1[("E1 Policy Versions DB")]
+    E2[("E2 Device DB")]
+    E3[("E3 Policy Bundles + CDN")]
+    E4[("E4 Rollout DB")]
+    E5[("E5 Events + Health")]
+
+    TA -->|"1a. policy edits (rules, exclusions, settings)"| Q1
+    Q1 -->|"1b. immutable version N+1"| E1
+    E1 -->|"2a. new version + diff vs N"| Q2
+    E2 -->|"2b. agent versions in target group"| Q2
+    Q2 -->|"2c. errors or warnings (e.g. exclusion covers a whole drive)"| TA
+
+    E2 -->|"3a. matching devices per group"| Q3
+    Q3 -->|"3b. device counts, audit-mode dry-run results"| TA
+
+    APR -->|"4a. approval (needed if risky)"| Q4
+    E1 -->|"4b. approved version"| Q4
+    Q4 -->|"4c. signed bundle per agent schema version"| E3
+
+    TA -->|"5a. target groups, plan 1% / 10% / 50% / 100%"| Q5
+    Q5 -->|"5b. rollout + stage snapshot"| E4
+
+    DEV -->|"6a. check-in: policy rev, agent version"| Q6
+    E4 -->|"6b. snapshot"| Q6
+    E2 -->|"6c. device attributes"| Q6
+    Q6 -->|"6d. desired policy rev + bundle URL for its schema"| DEV
+
+    E3 -->|"7a. signed bundle"| Q7
+    DEV <-->|"7b. apply, keep last good policy, revert if unhealthy"| Q7
+    Q7 -->|"7c. APPLIED / REJECTED / REVERTED events"| E5
+
+    E5 -->|"8a. stream"| Q8
+    Q8 -->|"8b. sensor health, block-event rate: new vs old policy"| Q9
+    Q9 -->|"9a. next stage / halt + revert to version N"| E4
+    Q9 -->|"9b. alert"| ONC
+    Q9 -.->|"9c. check in now hint"| DEV
+```
+
+| Step | What happens |
+|---|---|
+| 1 | Admin saves a policy. It becomes a new immutable version in E1. |
+| 2 | Validated against the schema of **every agent version** in the target group, then linted for dangerous rules (e.g. excluding a whole drive, disabling protection). |
+| 3 | Impact preview: how many devices match, and optionally a dry run in audit mode (log what *would* be blocked). |
+| 4 | Risky changes need a second approver. Compiler builds one bundle per agent schema version and signs it with the policy key. Stored in E3. |
+| 5 | Per-tenant rollout, faster than binaries: e.g. 1% → 10% → 50% → 100% over about an hour. |
+| 6 | Device checks in and gets the policy revision + the bundle that matches its agent version. |
+| 7 | Device verifies signature, validates in a sandbox, applies, keeps the previous policy as last good, reverts on its own if the sensor becomes unhealthy. |
+| 8 | Flink compares sensor health and **block-event rate** for new vs old policy. A jump in blocks means the policy is probably breaking business apps. |
+| 9 | Pass: next stage. Fail: halt and roll back to version N (which is just another rollout), alert tenant admin and on-call. |
+
+#### Upgrade vs Policy: Key Differences
+
+| | Sensor upgrade | Policy rollout |
+|---|---|---|
+| Who starts it | Vendor operator | Usually tenant admin |
+| Scope | Whole fleet, across tenants | One tenant |
+| Speed | Days to weeks | Minutes to an hour |
+| Size | ~80 MB (or ~15 MB delta) | ~200 KB (deltas a few KB) |
+| On device | A/B slots, may need reboot | Hot swap, keep last good policy |
+| Main extra gate | Crash rate, boot failures, devices gone silent | Block-event rate (is it breaking apps?) |
+| Extra checks before rollout | Test matrix on every OS/kernel | Schema check per agent version, lint, impact preview, dry run |
+| Signing key | Code-signing key | Separate policy key |
+
+In the interview, draw the **Level 1 Sensor Upgrade DFD** (or the sequence diagram, not both). For policy, say "same loop, with these differences" and use the table above.
+
 ## 6. Deep Dives (24–38 min)
 
 Say: **"I'd like to go deep on rollout safety, since that's where the risk is. Would you rather I cover something else?"**
